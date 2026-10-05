@@ -47,23 +47,112 @@ FEEDS = {
         "url": "https://www.computer.org/publications/tech-news",
         "type": "computer_html",
     },
+    # --- Tier 1: plain RSS (verified 2026-10-05) ---
+    "hn": {
+        "name": "🟧 Hacker News",
+        "url": "https://news.ycombinator.com/rss",
+        "type": "rss",
+        # HN returns 419 with a browser UA; use no custom headers.
+        "headers": {},
+    },
+    "tomshardware": {
+        "name": "🖥️ Tom's Hardware",
+        "url": "https://www.tomshardware.com/feeds.xml",
+        "type": "rss",
+    },
+    "theregister": {
+        "name": "📡 The Register",
+        "url": "https://www.theregister.com/headlines.atom",
+        "type": "rss",
+    },
+    "mit_techreview": {
+        "name": "🎓 MIT Technology Review",
+        "url": "https://www.technologyreview.com/feed/",
+        "type": "rss",
+    },
+    "sciencenews": {
+        "name": "🔬 Science News",
+        "url": "https://www.sciencenews.org/feed",
+        "type": "rss",
+    },
+    "infoq": {
+        "name": "📚 InfoQ",
+        "url": "https://feed.infoq.com/",
+        "type": "rss",
+    },
+    "openai": {
+        "name": "🤖 OpenAI News",
+        "url": "https://openai.com/news/rss.xml",
+        "type": "rss",
+    },
+    "githubblog": {
+        "name": "🐙 GitHub Blog",
+        "url": "https://github.blog/feed/",
+        "type": "rss",
+    },
+    "nvidia": {
+        "name": "💚 NVIDIA Blog",
+        "url": "https://blogs.nvidia.com/feed/",
+        "type": "rss",
+    },
+    "ars": {
+        "name": "🧪 Ars Technica",
+        "url": "https://feeds.arstechnica.com/arstechnica/index",
+        "type": "rss",
+    },
+    # --- Tier 2: HTML scraping (no public RSS) ---
+    "datacamp": {
+        "name": "📊 DataCamp Blog",
+        "url": "https://www.datacamp.com/blog",
+        "type": "datacamp_html",
+    },
+    "claude": {
+        "name": "🟠 Claude Blog",
+        "url": "https://claude.com/blog",
+        "type": "claude_html",
+    },
 }
 
 
-async def fetch_spectrum_rss(url: str, limit: int = 5) -> list[dict]:
-    """Fetch headlines from IEEE Spectrum RSS Feed."""
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
+async def fetch_rss(url: str, limit: int = 5, headers: dict | None = None) -> list[dict]:
+    """Fetch headlines from an RSS (or RSS-shaped Atom) feed.
+
+    Handles both <item> (RSS) and <entry> (Atom) payloads, and Atom-style
+    <link href="..."/> elements.
+    """
+    hdrs = HEADERS if headers is None else headers
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=hdrs) as client:
         response = await client.get(url)
         response.raise_for_status()
 
     root = ET.fromstring(response.content)
     articles = []
     for item in root.findall(".//item")[:limit]:
-        title = item.findtext("title", default="No Title").strip()
-        link = item.findtext("link", default="").strip()
+        title = (item.findtext("title", default="") or "").strip()
+        link = (item.findtext("link", default="") or "").strip()
         if title and link:
             articles.append({"title": html.unescape(title), "link": link})
+
+    if len(articles) < limit:
+        # Atom fallback: <entry> with <link href="..."/>
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall(".//a:entry", ns)[:limit]:
+            title_el = entry.find("a:title", ns)
+            link_el = entry.find("a:link", ns)
+            title = (title_el.text or "").strip() if title_el is not None and title_el.text else ""
+            link = ""
+            if link_el is not None:
+                link = link_el.get("href", "") or (link_el.text or "").strip()
+            if title and link:
+                articles.append({"title": html.unescape(title), "link": link})
+            if len(articles) >= limit:
+                break
     return articles
+
+
+async def fetch_spectrum_rss(url: str, limit: int = 5) -> list[dict]:
+    """Back-compat wrapper kept for existing callers/tests."""
+    return await fetch_rss(url, limit)
 
 
 async def fetch_pes_html(url: str, limit: int = 5) -> list[dict]:
@@ -101,16 +190,100 @@ async def fetch_computer_html(url: str, limit: int = 5) -> list[dict]:
 
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
-        if "/publications/tech-news/" in href and href not in seen_links:
-            title = a_tag.get_text(strip=True)
-            if title and "read more" not in title.lower() and len(title) > 15:
-                seen_links.add(href)
-                full_link = href if href.startswith("http") else f"https://www.computer.org{href}"
-                articles.append({"title": html.unescape(title), "link": full_link})
-                if len(articles) >= limit:
-                    break
+        # Tech-news articles live under /publications/tech-news/, but
+        # announcements (e.g. election results) live under /press-room/.
+        if (
+            "/publications/tech-news/" not in href
+            and "/press-room/" not in href
+        ) or href in seen_links:
+            continue
+        title = a_tag.get_text(strip=True)
+        if title and "read more" not in title.lower() and len(title) > 15:
+            seen_links.add(href)
+            full_link = href if href.startswith("http") else f"https://www.computer.org{href}"
+            articles.append({"title": html.unescape(title), "link": full_link})
+            if len(articles) >= limit:
+                break
 
     return articles
+
+
+async def fetch_blog_list_html(
+    url: str, base_url: str, path_marker: str = "/blog/", limit: int = 5
+) -> list[dict]:
+    """Generic scraper for blogs without RSS (DataCamp, Claude).
+
+    Collects <a> tags whose href contains path_marker, skipping
+    category/index pages, deduping links.
+    """
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    articles = []
+    seen_links = set()
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if path_marker not in href:
+            continue
+        # Skip index/category/pagination pages — only article links.
+        lowered = href.lower()
+        if "categor" in lowered or lowered.rstrip("/").endswith("/blog"):
+            continue
+        title = a_tag.get_text(strip=True)
+        if not title or len(title) < 20:
+            continue
+        full_link = href if href.startswith("http") else f"{base_url}{href}"
+        if full_link in seen_links:
+            continue
+        seen_links.add(full_link)
+        articles.append({"title": html.unescape(title), "link": full_link})
+        if len(articles) >= limit:
+            break
+    return articles
+
+
+async def fetch_datacamp_html(url: str, limit: int = 5) -> list[dict]:
+    """Fetch headlines from the DataCamp blog, newest first.
+
+    Articles render in chronological order inside
+    <div data-test-id="all-articles"> as media-card links
+    (<a data-trackid="media-card-...">) with the title in an <h2>.
+    Falls back to the generic blog scraper if the markup changes.
+    """
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    articles = []
+    seen_links = set()
+    container = soup.find("div", attrs={"data-test-id": "all-articles"})
+    if container is not None:
+        for a_tag in container.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("/blog/") or "categor" in href.lower():
+                continue
+            h2 = a_tag.find("h2")
+            title = h2.get_text(strip=True) if h2 else a_tag.get_text(strip=True)
+            if not title or len(title) < 15:
+                continue
+            full_link = f"https://www.datacamp.com{href}"
+            if full_link in seen_links:
+                continue
+            seen_links.add(full_link)
+            articles.append({"title": html.unescape(title), "link": full_link})
+            if len(articles) >= limit:
+                break
+    if not articles:
+        return await fetch_blog_list_html(url, "https://www.datacamp.com", "/blog/", limit)
+    return articles
+
+
+async def fetch_claude_blog_html(url: str, limit: int = 5) -> list[dict]:
+    """Fetch headlines from the Claude (Anthropic) blog."""
+    return await fetch_blog_list_html(url, "https://claude.com", "/blog/", limit)
 
 
 async def fetch_headlines(feed_key: str, limit: int = 5) -> list[dict]:
@@ -119,27 +292,27 @@ async def fetch_headlines(feed_key: str, limit: int = 5) -> list[dict]:
     feed_type = feed_info["type"]
 
     if feed_type == "rss":
-        return await fetch_spectrum_rss(feed_info["url"], limit)
+        return await fetch_rss(
+            feed_info["url"], limit, headers=feed_info.get("headers")
+        )
     elif feed_type == "pes_html":
         return await fetch_pes_html(feed_info["url"], limit)
     elif feed_type == "computer_html":
         return await fetch_computer_html(feed_info["url"], limit)
+    elif feed_type == "datacamp_html":
+        return await fetch_datacamp_html(feed_info["url"], limit)
+    elif feed_type == "claude_html":
+        return await fetch_claude_blog_html(feed_info["url"], limit)
     return []
 
 
 def get_news_keyboard() -> InlineKeyboardMarkup:
-    """Build inline buttons for feed selection."""
-    buttons = [
-        [
-            InlineKeyboardButton(FEEDS["spectrum"]["name"], callback_data="spectrum"),
-        ],
-        [
-            InlineKeyboardButton(FEEDS["pes"]["name"], callback_data="pes"),
-        ],
-        [
-            InlineKeyboardButton(FEEDS["computer"]["name"], callback_data="computer"),
-        ],
-    ]
+    """Build inline buttons for feed selection (2 columns to fit many sources)."""
+    keys = list(FEEDS.keys())
+    buttons = []
+    for i in range(0, len(keys), 2):
+        row = [InlineKeyboardButton(FEEDS[k]["name"], callback_data=k) for k in keys[i : i + 2]]
+        buttons.append(row)
     return InlineKeyboardMarkup(buttons)
 
 
