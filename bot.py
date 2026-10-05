@@ -190,14 +190,20 @@ async def fetch_computer_html(url: str, limit: int = 5) -> list[dict]:
 
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
-        if "/publications/tech-news/" in href and href not in seen_links:
-            title = a_tag.get_text(strip=True)
-            if title and "read more" not in title.lower() and len(title) > 15:
-                seen_links.add(href)
-                full_link = href if href.startswith("http") else f"https://www.computer.org{href}"
-                articles.append({"title": html.unescape(title), "link": full_link})
-                if len(articles) >= limit:
-                    break
+        # Tech-news articles live under /publications/tech-news/, but
+        # announcements (e.g. election results) live under /press-room/.
+        if (
+            "/publications/tech-news/" not in href
+            and "/press-room/" not in href
+        ) or href in seen_links:
+            continue
+        title = a_tag.get_text(strip=True)
+        if title and "read more" not in title.lower() and len(title) > 15:
+            seen_links.add(href)
+            full_link = href if href.startswith("http") else f"https://www.computer.org{href}"
+            articles.append({"title": html.unescape(title), "link": full_link})
+            if len(articles) >= limit:
+                break
 
     return articles
 
@@ -239,8 +245,40 @@ async def fetch_blog_list_html(
 
 
 async def fetch_datacamp_html(url: str, limit: int = 5) -> list[dict]:
-    """Fetch headlines from the DataCamp blog (whole blog, not a single article)."""
-    return await fetch_blog_list_html(url, "https://www.datacamp.com", "/blog/", limit)
+    """Fetch headlines from the DataCamp blog, newest first.
+
+    Articles render in chronological order inside
+    <div data-test-id="all-articles"> as media-card links
+    (<a data-trackid="media-card-...">) with the title in an <h2>.
+    Falls back to the generic blog scraper if the markup changes.
+    """
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    articles = []
+    seen_links = set()
+    container = soup.find("div", attrs={"data-test-id": "all-articles"})
+    if container is not None:
+        for a_tag in container.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("/blog/") or "categor" in href.lower():
+                continue
+            h2 = a_tag.find("h2")
+            title = h2.get_text(strip=True) if h2 else a_tag.get_text(strip=True)
+            if not title or len(title) < 15:
+                continue
+            full_link = f"https://www.datacamp.com{href}"
+            if full_link in seen_links:
+                continue
+            seen_links.add(full_link)
+            articles.append({"title": html.unescape(title), "link": full_link})
+            if len(articles) >= limit:
+                break
+    if not articles:
+        return await fetch_blog_list_html(url, "https://www.datacamp.com", "/blog/", limit)
+    return articles
 
 
 async def fetch_claude_blog_html(url: str, limit: int = 5) -> list[dict]:
